@@ -1,0 +1,13 @@
+[package]
+name = "mailmap-generator"
+version = "0.1.0"
+edition = "2021"
+description = "Generate suggested Git .mailmap files from commit history"
+
+[lib]
+name = "mailmap_generator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mailmap"
+path = "src/main.rs"
