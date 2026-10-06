@@ -76,7 +76,40 @@ fn parse_coauthors(messages: &str) -> Vec<String> {
     coauthors
 }
 
-fn compute_mailmap_rows(authors: impl IntoIterator<Item = String>) -> Vec<(String, String)> {
+fn preferred_name_format(name: &str) -> bool {
+    let mut parts = name.split_whitespace();
+    let Some(first_name) = parts.next() else {
+        return false;
+    };
+    let Some(last_name) = parts.next_back() else {
+        return false;
+    };
+
+    let mut chars = first_name.chars();
+    let first_char_is_uppercase = chars.next().is_some_and(char::is_uppercase);
+    first_char_is_uppercase
+        && chars.all(char::is_lowercase)
+        && last_name.chars().any(|ch| ch.is_alphabetic())
+        && last_name
+            .chars()
+            .filter(|ch| ch.is_alphabetic())
+            .all(char::is_uppercase)
+}
+
+fn email_matches_domain(email: &str, domain: Option<&str>) -> bool {
+    let Some(domain) = domain else {
+        return false;
+    };
+    let domain = domain.trim().trim_start_matches('@');
+    email
+        .rsplit_once('@')
+        .is_some_and(|(_, email_domain)| email_domain.eq_ignore_ascii_case(domain))
+}
+
+fn compute_mailmap_rows(
+    authors: impl IntoIterator<Item = String>,
+    preferred_domain: Option<&str>,
+) -> Vec<(String, String)> {
     let unique_authors: BTreeSet<String> = authors.into_iter().collect();
     let parsed: Vec<Author> = unique_authors
         .iter()
@@ -132,13 +165,28 @@ fn compute_mailmap_rows(authors: impl IntoIterator<Item = String>) -> Vec<(Strin
     for mut group in groups.drain(..) {
         group.sort();
         group.dedup();
-        let Some(canonical) = group.first().cloned() else {
+        let Some(canonical_index) = group
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, identity)| {
+                let author = parse_author(identity);
+                let domain_match = author
+                    .as_ref()
+                    .is_some_and(|author| email_matches_domain(&author.email, preferred_domain));
+                let preferred_name = author
+                    .as_ref()
+                    .is_some_and(|author| preferred_name_format(&author.name));
+                (!domain_match, !preferred_name, identity.as_str())
+            })
+            .map(|(index, _)| index)
+        else {
             continue;
         };
-        let aliases: Vec<String> = if group.len() == 1 {
+        let canonical = group.remove(canonical_index);
+        let aliases: Vec<String> = if group.is_empty() {
             vec![String::new()]
         } else {
-            group.into_iter().skip(1).collect()
+            group
         };
 
         for alias in aliases {
@@ -152,13 +200,24 @@ fn compute_mailmap_rows(authors: impl IntoIterator<Item = String>) -> Vec<(Strin
 
 /// Generate suggested `.mailmap` contents from one or more Git repositories.
 pub fn create_mailmap<P: AsRef<Path>>(paths_to_repos: &[P]) -> io::Result<String> {
+    create_mailmap_with_domain(paths_to_repos, None)
+}
+
+/// Generate `.mailmap` contents, preferring identities on `preferred_domain`.
+pub fn create_mailmap_with_domain<P: AsRef<Path>>(
+    paths_to_repos: &[P],
+    preferred_domain: Option<&str>,
+) -> io::Result<String> {
     let mut authors = Vec::new();
     for path in paths_to_repos {
         let path = path.as_ref();
         authors.extend(get_authors_from_git(path)?);
         authors.extend(get_coauthors_from_git(path)?);
     }
-    Ok(mailmap_rows_to_string(compute_mailmap_rows(authors)))
+    Ok(mailmap_rows_to_string(compute_mailmap_rows(
+        authors,
+        preferred_domain,
+    )))
 }
 
 fn mailmap_rows_to_string(rows: Vec<(String, String)>) -> String {
@@ -184,10 +243,13 @@ mod tests {
 
     #[test]
     fn same_email_maps_name_variants_to_first_sorted_identity() {
-        let rows = compute_mailmap_rows(identities(&[
-            "Alice Smith <alice@example.com>",
-            "A. Smith <alice@example.com>",
-        ]));
+        let rows = compute_mailmap_rows(
+            identities(&[
+                "Alice Smith <alice@example.com>",
+                "A. Smith <alice@example.com>",
+            ]),
+            None,
+        );
         assert_eq!(
             rows,
             vec![(
@@ -199,10 +261,13 @@ mod tests {
 
     #[test]
     fn same_name_maps_different_emails() {
-        let rows = compute_mailmap_rows(identities(&[
-            "Alice Smith <alice@work.example>",
-            "Alice Smith <alice@home.example>",
-        ]));
+        let rows = compute_mailmap_rows(
+            identities(&[
+                "Alice Smith <alice@work.example>",
+                "Alice Smith <alice@home.example>",
+            ]),
+            None,
+        );
         assert_eq!(
             rows,
             vec![(
@@ -213,11 +278,73 @@ mod tests {
     }
 
     #[test]
+    fn preferred_domain_selects_canonical_email() {
+        let rows = compute_mailmap_rows(
+            identities(&[
+                "Alice Smith <alice@personal.example>",
+                "Alice Smith <alice@work.example>",
+            ]),
+            Some("WORK.EXAMPLE"),
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                "Alice Smith <alice@work.example>".to_owned(),
+                "Alice Smith <alice@personal.example>".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn preferred_name_style_selects_canonical_identity() {
+        let rows = compute_mailmap_rows(
+            identities(&[
+                "MAYA Stone <maya@example.com>",
+                "Maya STONE <maya@example.com>",
+            ]),
+            None,
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                "Maya STONE <maya@example.com>".to_owned(),
+                "MAYA Stone <maya@example.com>".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn domain_and_name_preferences_select_canonical_identity() {
+        let rows = compute_mailmap_rows(
+            identities(&[
+                "MAYA Stone <maya@corp.example>",
+                "Maya STONE <maya@corp.example>",
+                "MAYA Stone <maya@personal.example>",
+            ]),
+            Some("corp.example"),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "Maya STONE <maya@corp.example>".to_owned(),
+                    "MAYA Stone <maya@corp.example>".to_owned()
+                ),
+                (
+                    "Maya STONE <maya@corp.example>".to_owned(),
+                    "MAYA Stone <maya@personal.example>".to_owned()
+                )
+            ]
+        );
+    }
+
+    #[test]
     fn unrelated_single_identity_retains_empty_alias_field() {
         assert_eq!(
-            mailmap_rows_to_string(compute_mailmap_rows(identities(&[
-                "Solo Person <solo@example.com>",
-            ]))),
+            mailmap_rows_to_string(compute_mailmap_rows(
+                identities(&["Solo Person <solo@example.com>",]),
+                None
+            )),
             "Solo Person <solo@example.com> \n"
         );
     }
@@ -243,11 +370,14 @@ mod tests {
 
     #[test]
     fn multiname_email_group_joins_matching_name_group() {
-        let rows = compute_mailmap_rows(identities(&[
-            "Alice Smith <shared@example.com>",
-            "A. Smith <shared@example.com>",
-            "Alice Smith <alice@example.com>",
-        ]));
+        let rows = compute_mailmap_rows(
+            identities(&[
+                "Alice Smith <shared@example.com>",
+                "A. Smith <shared@example.com>",
+                "Alice Smith <alice@example.com>",
+            ]),
+            None,
+        );
         assert_eq!(
             rows,
             vec![
